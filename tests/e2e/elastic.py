@@ -22,12 +22,12 @@ import json
 import math
 import os
 import struct
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
+from e2e.memory import MemoryProbe
 from e2e import client as cl
 from e2e.matrix import BATCH_FLAG, ELASTIC_BATCH, Case, ElasticPair
 from e2e.run import (
@@ -76,13 +76,6 @@ CHECKS = {
 }
 
 
-def gpu_memory_mib(gpu: str) -> tuple[int, int]:
-    out = subprocess.run(["nvidia-smi", "-i", gpu, "--query-gpu=memory.used,memory.total",
-                          "--format=csv,noheader,nounits"], capture_output=True, text=True)
-    used, total = (int(x) for x in out.stdout.strip().split(","))
-    return used, total
-
-
 def read_segments() -> dict[str, int]:
     """Used KV bytes of every kvcached segment in /dev/shm, read as kvctl does:
     three int64s (limit, used, preallocated) under a shared flock. /dev/shm
@@ -107,8 +100,9 @@ def read_segments() -> dict[str, int]:
 class Usage:
     """Sample the kvcached segments and the GPU's memory once a second."""
 
-    def __init__(self, gpu: str) -> None:
-        self.gpu = gpu
+    def __init__(self, probe: MemoryProbe) -> None:
+        self.probe = probe
+        self.error = None
         self.samples: list[tuple[float, int, dict[str, int]]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -125,10 +119,16 @@ class Usage:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            self.samples.append((time.time(), gpu_memory_mib(self.gpu)[0], read_segments()))
-            time.sleep(1)
+            try:
+                self.samples.append((time.time(), self.probe.read()[0], read_segments()))
+            except Exception as e:
+                self.error = e
+                return
+            self._stop.wait(0.25)
 
     def peak(self, srv: Server, since: float) -> int:
+        if self.error:
+            raise RuntimeError("GPU sampling failed") from self.error
         return max((self.of(srv, u) for t, _, u in self.samples if t >= since), default=0)
 
     def gpu_peak_mib(self, since: float) -> int:
@@ -149,13 +149,14 @@ def burst(srv: Server, pool: ThreadPoolExecutor, n: int, seed: int) -> list[cl.R
 def drain(usage: Usage, srv: Server, timeout: float = 60) -> int:
     """Reset the server's prefix cache, so that finished requests hold no KV,
     and wait until its usage stops falling; return it."""
-    srv.client.reset_prefix_cache()
+    if not srv.client.reset_prefix_cache():
+        raise RuntimeError("prefix-cache reset failed")
     last = usage.used(srv)
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(5)
         now = usage.used(srv)
-        if now >= last:
+        if now == 0 or (now >= last and time.time() >= deadline - timeout + 15):
             return now
         last = now
     return last
@@ -178,24 +179,31 @@ def start_ballast(ct: Container, mib: int) -> str:
 
 
 def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str,
-                base_port: int, timeout: float, emulate_gpu_mib: int = 0) -> CaseResult:
+                base_port: int, timeout: float, emulate_gpu_mib: int = 0, budget_mib: int = 0) -> CaseResult:
     """Server A runs in ct_a and server B in ct_b; both use GPU ct_a.gpu."""
     res = CaseResult(pair.name)
     gpu = ct_a.gpu
+    try:
+        probe = MemoryProbe(gpu)
+    except Exception as e:
+        res.add("memory_probe", False, str(e))
+        return res
+    res.log["memory_source"] = probe.source
+    res.log["budget_mib"] = budget_mib
     ballast: Optional[str] = None
-    if emulate_gpu_mib:
-        _, total = gpu_memory_mib(gpu)
-        if total > emulate_gpu_mib:
-            ballast = start_ballast(ct_a, total - emulate_gpu_mib)
-            res.log["ballast_mib"] = total - emulate_gpu_mib
-    case_a = Case(pair.engine_a, pair.model_a, "c1", tag="elastic")
-    case_b = Case(pair.engine_b, pair.model_b, "c1", tag="elastic")
+    case_a = Case(pair.engine_a, pair.model_a, "c1", tag="elastic-a")
+    case_b = Case(pair.engine_b, pair.model_b, "c1", tag="elastic-b")
     setup = {"kind": "elastic", "gpu": gpu, "batch": ELASTIC_BATCH,
              "a": case_setup(case_a), "b": case_setup(case_b)}
     res.log["setup"] = setup
     started: list[tuple[Container, Server]] = []
     usage: Optional[Usage] = None
     try:
+        if emulate_gpu_mib:
+            _, total = probe.read()
+            if total > emulate_gpu_mib:
+                ballast = start_ballast(ct_a, total - emulate_gpu_mib)
+                res.log["ballast_mib"] = total - emulate_gpu_mib
         # Start one after the other so the second sees the first's weights.
         for host, case, port, extra in ((ct_a, case_a, base_port + 1, pair.extra_args_a),
                                         (ct_b, case_b, base_port + 2, pair.extra_args_b)):
@@ -210,7 +218,14 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
         (_, a), (_, b) = started
         probes = cl.BASE_PROMPTS[:3]
         base = {s.ipc: s.client.run_phase("probe", probes, 32, 1) for _, s in started}
-        usage = Usage(gpu)
+        if budget_mib:
+            # Limits bound each instance without allocating ballast on unified memory.
+            for host, srv in started:
+                proc = host.exec(f"kvctl limit {srv.ipc} {budget_mib}M")
+                if proc.returncode or b'Error:' in proc.stderr:
+                    raise RuntimeError(f"setting KV budget failed: {proc.stderr!r}")
+            res.log["reuse_scope"] = "bounded KV budget, not device exhaustion"
+        usage = Usage(probe)
         mem: dict[str, float] = {}
         res.log["memory_mib"] = mem
         res.log["segments"] = {k: v for k, v in read_segments().items()
@@ -222,11 +237,17 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
             for srv in (a, b):
                 before = usage.used(srv)
                 t = time.time()
-                burst(srv, pool, 4, 1_000)
+                calibration = burst(srv, pool, 4, 1_000)
+                if not all(r.ok for r in calibration):
+                    raise RuntimeError("elastic calibration request failed")
                 per_request[srv.ipc] = max(usage.peak(srv, t) - before, MIB) / 4
                 drain(usage, srv)
-            idle_gpu, total = gpu_memory_mib(gpu)
+            idle_gpu, total = probe.read()
             free = (total - idle_gpu) * MIB
+            if budget_mib:
+                if free < 2 * budget_mib * MIB:
+                    raise RuntimeError("insufficient free memory for the bounded KV test")
+                free = budget_mib * MIB
             # More than the batch limit would only queue.
             n = {s.ipc: min(math.ceil(TARGET * free / per_request[s.ipc]), ELASTIC_BATCH)
                  for s in (a, b)}
@@ -239,6 +260,9 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
             results = burst(a, pool, n[a.ipc], 10_000)
             a_growth = usage.peak(a, t) - a_idle
             free_at_a_peak = (total - usage.gpu_peak_mib(t)) * MIB
+            physical_free_at_a_peak = free_at_a_peak
+            if budget_mib:
+                free_at_a_peak = free - a_growth
             res.add("a_requests_ok", all(r.ok for r in results),
                     f"{sum(not r.ok for r in results)}/{len(results)} failed")
             res.add("a_filled_memory", a_growth > 0.5 * free,
@@ -246,7 +270,14 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
 
             # 2. A gives its KV memory back.
             a_after = drain(usage, a)
-            mem["gpu_free_after_a"] = total - gpu_memory_mib(gpu)[0]
+            mem["gpu_free_after_a"] = total - probe.read()[0]
+            if budget_mib:
+                released = mem["gpu_free_after_a"] * MIB - physical_free_at_a_peak
+                mem["physical_release_after_a"] = released / MIB
+                # Require driver-visible release too, not only a counter change.
+                # 64 MiB tolerates small allocator/context accounting fluctuations.
+                res.add("a_physical_memory_released", a_growth > 0 and released + 64 * MIB >= 0.5 * a_growth,
+                        f"driver reports {released / MIB:.0f} MiB released after {a_growth / MIB:.0f} MiB KV growth")
             res.add("a_released_memory", a_after - a_idle < 0.5 * a_growth,
                     f"A still holds {(a_after - a_idle) / MIB:.0f} of the "
                     f"{a_growth / MIB:.0f} MiB it grew")
@@ -258,7 +289,7 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
             b_growth = usage.peak(b, t) - b_idle
             res.add("b_requests_ok", all(r.ok for r in results),
                     f"{sum(not r.ok for r in results)}/{len(results)} failed")
-            res.add("b_reused_a_memory", b_growth > free_at_a_peak,
+            res.add("b_reused_budget" if budget_mib else "b_reused_a_memory", b_growth > free_at_a_peak,
                     f"B grew {b_growth / MIB:.0f} MiB; {free_at_a_peak / MIB:.0f} MiB "
                     "was free at A's peak")
             drain(usage, b)
@@ -274,14 +305,18 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
 
         for host, srv in started:
             after = srv.client.run_phase("probe", probes, 32, 1)
-            same = all(x.token_ids == y.token_ids
+            same = base[srv.ipc].all_ok and all(x.token_ids == y.token_ids
                        for x, y in zip(base[srv.ipc].results, after.results))
             res.add(f"{srv.case.name}_probe_unchanged", after.all_ok and same)
             res.add(f"{srv.case.name}_alive", host.alive(srv.pid))
         return res
+    except Exception as e:
+        res.add("elastic_execution", False, str(e))
+        return res
     finally:
         if usage is not None:
             usage.stop()
+            res.add("memory_sampling", usage.error is None, str(usage.error or ""))
             # Per-second timeline, MiB: GPU memory used and each server's KV.
             timeline = [{"t": round(t, 1), "gpu": g,
                          **{srv.case.name: usage.of(srv, u) >> 20 for _, srv in started}}
@@ -291,4 +326,5 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
             stop_and_check(host, srv, res, prefix=f"{srv.case.name}_")
         if ballast is not None:
             ct_a.stop_server(ballast)
+        probe.close()
         check_gpu_released(res, ct_a.gpus)

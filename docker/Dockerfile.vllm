@@ -1,11 +1,25 @@
-FROM vllm/vllm-openai:v0.30.0
-RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} pip install kvcached --no-build-isolation
+# syntax=docker/dockerfile:1.7
+FROM vllm/vllm-openai:v0.30.0@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90 AS build
+COPY setup.py pyproject.toml MANIFEST.in README.md LICENSE kvcached_autopatch.pth /opt/kvcached-src/
+COPY csrc /opt/kvcached-src/csrc
+COPY kvcached /opt/kvcached-src/kvcached
+COPY docker/install-wheel.sh /opt/kvcached-src/docker/install-wheel.sh
+RUN bash /opt/kvcached-src/docker/install-wheel.sh
 
-ENV ENABLE_KVCACHED=true
-ENV KVCACHED_AUTOPATCH=1
-ENV KVCACHED_IPC_NAME=VLLM
-
+FROM vllm/vllm-openai:v0.30.0@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90
+COPY --from=build /tmp/wheels /tmp/wheels
+RUN python3 -m pip install --no-index --find-links=/tmp/wheels /tmp/wheels/kvcached-*.whl && rm -rf /tmp/wheels
+ENV ENABLE_KVCACHED=true KVCACHED_AUTOPATCH=1 KVCACHED_IPC_NAME=VLLM
 EXPOSE 8080 12346 30000 30001
-
 ENTRYPOINT []
 CMD ["bash"]
+
+ARG SOURCE_REVISION=unknown
+ARG SOURCE_URL=https://github.com/ovg-project/kvcached
+LABEL org.opencontainers.image.source=$SOURCE_URL \
+      org.opencontainers.image.revision=$SOURCE_REVISION \
+      org.opencontainers.image.version="0.1.6" \
+      org.opencontainers.image.base.name="vllm/vllm-openai:v0.30.0" \
+      org.opencontainers.image.base.digest="sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90" \
+      io.kvcached.engine="vllm" \
+      io.kvcached.engine.version="0.30.0"

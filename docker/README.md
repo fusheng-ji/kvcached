@@ -88,3 +88,112 @@ docker build -f docker/Dockerfile.sglang -t kvcached-sglang .
 # Build development image
 docker build -f docker/Dockerfile.dev -t kvcached-dev .
 ```
+
+## Native ARM64 and AMD64 release images
+
+The engine Dockerfiles install a wheel built from **this checkout**, not the
+latest package on PyPI. The upstream vLLM 0.30.0 and SGLang 0.5.20 multi-platform
+base images are pinned by digest. The extension is compiled natively on each
+architecture; no QEMU or cross-architecture GPU emulation is used. CUDA driver
+stubs are used only during linking. The runtime uses the host NVIDIA driver.
+The combined development image is outside this release workflow. The build
+records pre-existing dependency conflicts in the upstream images and rejects
+new conflicts introduced by installing kvcached; it does not silently upgrade
+the engine dependency stack to repair unrelated upstream issues.
+
+Build on the target architecture (use `amd64` on an x86_64 host):
+
+```bash
+revision=$(git rev-parse HEAD)
+for engine in vllm sglang; do
+  docker build --platform linux/arm64 -f "docker/Dockerfile.$engine" \
+    --build-arg SOURCE_REVISION="$revision" \
+    --build-arg SOURCE_URL=https://github.com/fusheng-ji/kvcached \
+    -t "kvcached-$engine:qualification" .
+done
+```
+
+### Qualify the actual installed images
+
+Use an idle NVIDIA GPU, a compatible NVIDIA container runtime and Python 3.10+
+on the host. The public Qwen2.5-0.5B-Instruct model downloads into the Hugging Face
+cache on the first run. Do not run qualification alongside a training job.
+
+```bash
+python3 tests/e2e/run.py --profile release --gpus 0 --no-install \
+  --image vllm=kvcached-vllm:qualification \
+  --image sglang=kvcached-sglang:qualification \
+  --elastic-budget-mib 2048 --out /tmp/kvcached-qualification
+```
+
+Use the same command on AMD64. `--engines vllm` or `--engines sglang` selects one
+engine while debugging; full release qualification requires both. Image overrides
+require `--no-install` and reject local-host mode so tests cannot silently replace
+the installed package with the checkout. Installation checks load the native
+extension, check its ELF architecture and verify automatic patch hooks. Serving
+checks compare greedy tokens and prefix-cache behavior against the native engine.
+
+On GB10, `nvidia-smi` may report `N/A` for memory. The sampler then keeps a CUDA
+primary context on the GPU selected by PCI identity and reads `cuMemGetInfo`.
+Errors in initialization or the sampling thread fail qualification. These CUDA
+counters on unified-memory systems are **not** Linux `MemAvailable`.
+
+The bounded elastic test sets each instance's KV limit to 2 GiB, tests allocation,
+release of at least half the observed growth after cache reset (including a
+driver-visible memory decrease, with 64 MiB accounting tolerance), subsequent growth
+by the second instance, concurrent requests and unchanged greedy probes. It uses
+no memory ballast. Its `b_reused_budget` assertion measures reuse within a logical
+KV budget, **not proof of device-wide exhaustion or reuse of the same physical
+pages**. The existing unbounded test retains its device-pressure assertion.
+Use the latter only on a dedicated GPU with enough load to fill it. Logs, versions,
+model revisions, memory source, time series and checks are written to the output
+directory. A missing or failed GPU run is not a passing release qualification.
+
+### Candidate build → GPU qualification → promotion
+
+All three workflows must run from the **same commit**. Repository owners are
+lowercased for GHCR, so forks publish to their own namespace automatically.
+
+1. Configure `IMAGE_AMD64_RUNNER` and `IMAGE_ARM64_RUNNER` for native runners with
+   at least 100 GiB free disk and sufficient RAM (16 GiB minimum recommended).
+   Defaults are `ubuntu-24.04` and `ubuntu-24.04-arm`; standard runners may fail
+   the explicit disk preflight. Use larger hosted runners for PR builds; never
+   expose a privileged self-hosted runner to untrusted PR code. PR runs build
+   only and do not log into GHCR or push packages.
+2. Dispatch **Container candidates**. All four engine/architecture jobs must
+   succeed. Each publishes a commit/architecture candidate tag and uploads its
+   immutable digest. Candidates are not official version tags.
+3. Configure dedicated native NVIDIA GPU runners with labels
+   `[self-hosted, Linux, ARM64, kvcached-release-gpu]` and
+   `[self-hosted, Linux, X64, kvcached-release-gpu]`, or override
+   `IMAGE_ARM64_GPU_RUNNER` / `IMAGE_AMD64_GPU_RUNNER` with JSON label arrays.
+   They need Docker, the NVIDIA runtime, Python, `gh`, model-network access and
+   disk space for both images. Dispatch **Qualify container candidates** once
+   per architecture using the successful candidate run ID. Each tests exact
+   digests, without reinstalling kvcached, and uploads GPU evidence and logs.
+4. Inspect both results. Configure the `container-release` GitHub environment
+   with required reviewers for human approval. Dispatch **Promote qualified
+   containers** with the candidate run ID and both qualification run IDs.
+   It verifies successful workflow provenance, matching commits, four image
+   platforms/version labels and complete passing evidence bound to each digest.
+   Only then does it create the two multi-platform version manifests and update
+   `latest`. Metadata validation does not pull image layers.
+
+Tags retain the existing format, for example
+`kvcached-v0.1.6-vllm-v0.30.0`. Update Dockerfile version labels, the qualification
+matrix and `tools/release/images.py` together for a future engine/package release.
+Preflight failures change no official tags. Registry writes across two image
+repositories are not transactional: if the registry fails during promotion,
+re-run the same validated inputs; `latest` is updated only after both version
+manifests have been created. Artifacts expire after 30 days, so rebuild/requalify
+when evidence is no longer available.
+
+For a promotion dry run, download the candidate and evidence artifacts and run:
+
+```bash
+python3 tools/release/images.py promote --candidates candidates --evidence evidence \
+  --revision "$(git rev-parse HEAD)" --namespace fusheng-ji
+```
+
+Set `GH_TOKEN` for private GHCR packages. Publishing requires the explicit
+`--publish` option; do not use it for local qualification.

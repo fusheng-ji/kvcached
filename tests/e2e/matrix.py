@@ -130,6 +130,18 @@ MODELS = {
 }
 
 
+# Small release qualification model with a bounded server footprint on GB10.
+MODELS["release05b"] = ModelSpec(
+    "release05b", "Qwen/Qwen2.5-0.5B-Instruct",
+    args={
+        "vllm": ("--dtype", "bfloat16", "--max-model-len", "8192",
+                 "--max-num-seqs", "32", "--gpu-memory-utilization", "0.25"),
+        "sglang": ("--dtype", "bfloat16", "--context-length", "8192",
+                   "--max-running-requests", "32", "--mem-fraction-static", "0.25"),
+    },
+)
+
+
 TP_FLAG = {"vllm": "--tensor-parallel-size", "sglang": "--tp-size"}
 BATCH_FLAG = {"vllm": "--max-num-seqs", "sglang": "--max-running-requests"}
 ELASTIC_BATCH = 128
@@ -222,6 +234,11 @@ def groups(engines: tuple[str, ...], models: tuple[str, ...], **kwargs: Any) -> 
 
 
 PROFILES = {
+    "release": Profile(
+        groups=groups(("vllm", "sglang"), ("release05b",), layouts=("c1",)),
+        elastic=tuple(ElasticPair(e, "release05b", e, "release05b")
+                      for e in ("vllm", "sglang")),
+    ),
     # A quick end-to-end check of the CI plumbing.
     "smoke": Profile(groups=groups(("vllm", "sglang"), ("qwen05b",), layouts=("c1",))),
     # Run inside the weekly H100 sandbox, next to the performance runs.

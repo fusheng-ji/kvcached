@@ -1,0 +1,63 @@
+name: Qualify container candidates
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run:
+        description: Successful Container candidates run ID on this same commit
+        required: true
+      architecture:
+        type: choice
+        options: [arm64, amd64]
+        required: true
+permissions:
+  contents: read
+  actions: read
+  packages: read
+jobs:
+  gpu:
+    runs-on: ${{ fromJSON(inputs.architecture == 'arm64' && (vars.IMAGE_ARM64_GPU_RUNNER || '["self-hosted","Linux","ARM64","kvcached-release-gpu"]') || (vars.IMAGE_AMD64_GPU_RUNNER || '["self-hosted","Linux","X64","kvcached-release-gpu"]')) }}
+    timeout-minutes: 180
+    concurrency: release-gpu-${{ inputs.architecture }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify candidate run provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ inputs.candidate_run }}
+        run: |
+          gh api "repos/$GH_REPO/actions/runs/$RUN" > run.json
+          python3 - <<'PY'
+          import json, os
+          r = json.load(open('run.json'))
+          assert r['head_sha'] == os.environ['GITHUB_SHA'] and r['conclusion'] == 'success'
+          assert r['path'] == '.github/workflows/images.yml' and r['event'] == 'workflow_dispatch'
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.candidate_run }}
+          pattern: candidate-*
+          path: candidates
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Qualify finished images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          ARCH: ${{ inputs.architecture }}
+        run: |
+          python3 tools/release/images.py qualify --candidates candidates --evidence evidence \
+            --revision "$GITHUB_SHA" --namespace "${OWNER,,}" --arch "$ARCH"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-evidence-${{ inputs.architecture }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30

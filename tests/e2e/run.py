@@ -25,7 +25,7 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -86,7 +86,7 @@ def gpu_select(gpus: str) -> list[str]:
 def gpu_processes(gpus: str = "all") -> list[str]:
     """Compute processes on the GPUs a run uses."""
     out = sh(["nvidia-smi", *gpu_select(gpus), "--query-compute-apps=pid",
-              "--format=csv,noheader"])
+              "--format=csv,noheader"], check=True)
     return [x.strip() for x in out.stdout.decode().splitlines() if x.strip()]
 
 
@@ -164,6 +164,35 @@ python3 -c 'import kvcached, kvcached.vmm_ops; print("kvcached", kvcached.__file
         if proc.returncode != 0:
             raise RuntimeError(f"installing kvcached in {self.name} failed; see {log}")
 
+    def verify_installation(self, log: Path) -> None:
+        code = """import importlib.metadata as md, json, pathlib, platform
+import torch, kvcached, kvcached._C, kvcached.vmm_ops
+from wrapt.importer import _post_import_hooks
+p = pathlib.Path(kvcached._C.__file__)
+header = p.read_bytes()[:20]
+assert header[:4] == b'\\x7fELF', str(p)
+machine = int.from_bytes(header[18:20], 'little' if header[5] == 1 else 'big')
+assert machine == {'aarch64': 183, 'x86_64': 62}[platform.machine()], machine
+dist = md.distribution('kvcached')
+assert dist.read_text('direct_url.json') is None or '"editable": true' not in dist.read_text('direct_url.json')
+assert pathlib.Path(dist.locate_file('kvcached_autopatch.pth')).is_file()
+assert 'vllm' in _post_import_hooks and 'sglang' in _post_import_hooks
+print(json.dumps({'version': dist.version, 'architecture': platform.machine(),
+                  'extension': str(p), 'elf_machine': machine, 'autopatch_hooks': True}))
+"""
+        proc = self.exec(f"cd /tmp && python3 -c {shlex.quote(code)}", timeout=300)
+        log.write_bytes(proc.stdout + proc.stderr)
+        if proc.returncode:
+            raise RuntimeError(f"installed image check failed; see {log}")
+        verified = json.loads(proc.stdout.decode().strip().splitlines()[-1])
+        labels = self.image_metadata().get("labels", {})
+        expected = labels.get("org.opencontainers.image.version")
+        if expected and verified["version"] != expected:
+            raise RuntimeError("installed kvcached version does not match the image label")
+        expected_engine = labels.get("io.kvcached.engine.version")
+        if expected_engine and self.versions().get("engine") != expected_engine:
+            raise RuntimeError("installed engine version does not match the image label")
+
     def start_server(self, case_dir: str, env: dict[str, str], argv: list[str]) -> str:
         """Start a server in its own process group; return its pid (= the group id)."""
         log = f"{self.out_path}/{case_dir}/serve.log"
@@ -229,6 +258,14 @@ python3 -c 'import kvcached, kvcached.vmm_ops; print("kvcached", kvcached.__file
         except ValueError:
             return None
         return digests[0] if digests else None
+
+    def image_metadata(self) -> dict[str, Any]:
+        if isinstance(self, LocalHost):
+            return {}
+        proc = sh(DOCKER + ["image", "inspect", self.engine.image], check=True)
+        info = json.loads(proc.stdout)[0]
+        return {"image_id": info["Id"], "architecture": info["Architecture"],
+                "labels": info["Config"].get("Labels", {})}
 
     def remove(self) -> None:
         sh(DOCKER + ["rm", "-f", self.name])
@@ -530,6 +567,18 @@ def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, por
     (out / "setup.json").write_text(json.dumps(setup, indent=1))
 
 
+def image_overrides(values: list[str], no_install: bool, local: bool) -> dict[str, str]:
+    if values and (not no_install or local):
+        raise ValueError("--image requires --no-install and cannot be used with --local")
+    images = {}
+    for value in values:
+        engine, sep, reference = value.partition("=")
+        if not sep or engine not in ENGINES or not reference or engine in images:
+            raise ValueError(f"invalid or duplicate --image: {value}")
+        images[engine] = reference
+    return images
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -549,6 +598,10 @@ def main() -> int:
                     help="run the servers on this machine instead of in engine containers")
     ap.add_argument("--no-install", action="store_true",
                     help="use the kvcached already installed instead of this checkout")
+    ap.add_argument("--image", action="append", default=[], metavar="ENGINE=REFERENCE",
+                    help="test a finished image; requires --no-install")
+    ap.add_argument("--elastic-budget-mib", type=int, default=0,
+                    help="bounded shared KV budget; explicit limit transfer, no GPU ballast")
     ap.add_argument("--port", type=int, default=18000)
     ap.add_argument("--ready-timeout", type=float, default=1800)
     ap.add_argument("--elastic-gpu-mib", type=int, default=0,
@@ -556,18 +609,28 @@ def main() -> int:
                          "is usable, to run it on a larger GPU than the CI one")
     a = ap.parse_args()
 
+    try:
+        images = image_overrides(a.image, a.no_install, a.local)
+    except ValueError as e:
+        ap.error(str(e))
+    if a.elastic_budget_mib < 0 or (a.elastic_budget_mib and a.elastic_gpu_mib):
+        ap.error("use a nonnegative KV budget, without --elastic-gpu-mib")
     profile = PROFILES[a.profile]
-    run_id = time.strftime("%m%d%H%M")
+    if images.keys() - set(profile.engines):
+        ap.error("image engine is not part of the selected profile")
+    run_id = time.strftime("%m%d%H%M%S") + f"_{os.getpid()}"
     out = a.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     results: list[CaseResult] = []
 
     engines = [e for e in profile.engines if not a.engines or e in a.engines]
+    if a.profile == "release" and gpu_processes(a.gpus):
+        ap.error("release qualification requires idle GPUs; existing workloads will not be stopped")
     containers: dict[str, Container] = {}
     engine_info: dict[str, dict[str, Any]] = {}
     try:
         for engine in engines:
-            spec = ENGINES[engine]
+            spec = replace(ENGINES[engine], image=images.get(engine, ENGINES[engine].image))
             name = f"kvcached-e2e-{engine}-{run_id}"
             ct = (LocalHost(spec, name, a.gpus, out) if a.local
                   else Container(spec, name, a.gpus, out, a.hf_cache))
@@ -575,10 +638,11 @@ def main() -> int:
             try:
                 if not a.no_install:
                     ct.install_kvcached(a.repo, out / f"{engine}-install.log")
-                setup.add("install_kvcached", True)
+                ct.verify_installation(out / f"{engine}-installation.json")
+                setup.add("installed_package_verified", True)
                 containers[engine] = ct
                 engine_info[engine] = {"image": spec.image, "digest": ct.image_digest(),
-                                       **ct.versions()}
+                                       **ct.versions(), **ct.image_metadata()}
             except Exception as e:
                 setup.add("install_kvcached", False, str(e))
                 ct.remove()
@@ -616,7 +680,8 @@ def main() -> int:
                 ct_a, ct_b = containers.get(pair.engine_a), containers.get(pair.engine_b)
                 if ct_a and ct_b:
                     results.append(run_elastic(ct_a, ct_b, pair, run_id, a.port,
-                                               a.ready_timeout, a.elastic_gpu_mib))
+                                               a.ready_timeout, a.elastic_gpu_mib,
+                                               a.elastic_budget_mib))
                     report(results[-1])
     finally:
         for ct in containers.values():
