@@ -1,0 +1,71 @@
+{
+  "recorded_at": "2026-10-12T20:22:56.313316+00:00",
+  "source_revision": "951dcbf65d8c82c93af2d169757f151f3e915efa",
+  "architecture": "arm64",
+  "device": "NVIDIA GB10",
+  "driver": "580.173.02",
+  "status": "partial_gpu_validation_pending",
+  "images": {
+    "vllm": {
+      "local_reference": "kvcached-vllm:arm64-test",
+      "image_id": "sha256:8158767b8f5674ffcd2e3ee6f95d7a1cd255aec78a21f3d1192985c921da74d5",
+      "base_digest": "sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90",
+      "engine_version": "0.30.0",
+      "kvcached_version": "0.1.6",
+      "torch_version": "2.13.0+cu130",
+      "cuda_version": "13.0",
+      "installation": {
+        "version": "0.1.6",
+        "architecture": "aarch64",
+        "extension": "/usr/local/lib/python3.12/dist-packages/kvcached/_C.cpython-312-aarch64-linux-gnu.so",
+        "elf_machine": 183,
+        "autopatch_hooks": true
+      },
+      "native_build": "passed"
+    },
+    "sglang": {
+      "local_reference": "kvcached-sglang:arm64-test",
+      "image_id": "sha256:d8cc4d22a640241c173271a4f5bfeabd45270df59bbb87e0c5b61b18a83de05d",
+      "base_digest": "sha256:06e4f2ed21afde4ff513cda65070124e727ba23ccaeff7712b8c40e1097d611f",
+      "engine_version": "0.5.20",
+      "kvcached_version": "0.1.6",
+      "torch_version": "2.13.0+cu130",
+      "cuda_version": "13.0",
+      "installation": {
+        "version": "0.1.6",
+        "architecture": "aarch64",
+        "extension": "/opt/sglang/lib/python3.12/site-packages/kvcached/_C.cpython-312-aarch64-linux-gnu.so",
+        "elf_machine": 183,
+        "autopatch_hooks": true
+      },
+      "native_build": "passed"
+    }
+  },
+  "cpu_tests": {
+    "passed": 1295,
+    "skipped": 12,
+    "command": "PYTHON=/tmp/kvcached-test-venv/bin/python bash tools/run_cpu_tests.sh -q"
+  },
+  "static_checks": {
+    "actionlint": "1.7.12 passed",
+    "test_classification": "passed",
+    "shell_syntax": "passed",
+    "git_diff_check": "passed"
+  },
+  "gpu": {
+    "installation": "passed",
+    "inference": "not_run",
+    "elastic_reclaim": "not_run",
+    "reason": "Existing FastVideo training retains the GPU; user requested preserving it and testing after it finishes.",
+    "deferred_execution": "A one-shot local waiter uses the fixed source revision and immutable local image IDs after GPU 0 is idle."
+  },
+  "amd64": {
+    "build": "not_run",
+    "gpu_validation": "pending_user_machine"
+  },
+  "publication": {
+    "pull_request_created": false,
+    "images_pushed": false,
+    "release_workflows_executed": false
+  }
+}
