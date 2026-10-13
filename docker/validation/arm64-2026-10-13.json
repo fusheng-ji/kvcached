@@ -1,0 +1,131 @@
+{
+  "recorded_at": "2026-10-13T08:59:56.926963+00:00",
+  "source_revision": "a5deb46194d4958c50e595ca83057a4e0fbc1005",
+  "architecture": "arm64",
+  "device": "NVIDIA GB10",
+  "driver": "580.173.02",
+  "status": "partial_elastic_gpu_validation_pending",
+  "images": {
+    "vllm": {
+      "image_id": "sha256:b1e1f1da41401cb93dc42f59f07bc02620bcfa9734f998c8ac5f5d7ca852b7f6",
+      "architecture": "arm64",
+      "labels": {
+        "ai.vllm.build.commit": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+        "ai.vllm.build.pipeline": "019d130e-464e-4ff7-b84b-492992c0c06b",
+        "ai.vllm.build.url": "https://buildkite.com/vllm/release-v2/builds/7022",
+        "ai.vllm.image.tag": "vllm/vllm-openai:v0.30.0",
+        "io.kvcached.engine": "vllm",
+        "io.kvcached.engine.version": "0.30.0",
+        "maintainer": "NVIDIA CORPORATION <cudatools@nvidia.com>",
+        "org.opencontainers.image.base.digest": "sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90",
+        "org.opencontainers.image.base.name": "vllm/vllm-openai:v0.30.0",
+        "org.opencontainers.image.ref.name": "ubuntu",
+        "org.opencontainers.image.revision": "a5deb46194d4958c50e595ca83057a4e0fbc1005",
+        "org.opencontainers.image.source": "https://github.com/fusheng-ji/kvcached",
+        "org.opencontainers.image.url": "https://buildkite.com/vllm/release-v2/builds/7022",
+        "org.opencontainers.image.version": "0.1.6"
+      },
+      "engine": "0.30.0",
+      "kvcached": "0.1.6",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "installation": {
+        "version": "0.1.6",
+        "architecture": "aarch64",
+        "extension": "/usr/local/lib/python3.12/dist-packages/kvcached/_C.cpython-312-aarch64-linux-gnu.so",
+        "elf_machine": 183,
+        "autopatch_hooks": true
+      },
+      "native_build": "passed"
+    },
+    "sglang": {
+      "image_id": "sha256:a0fe65b80ff87455f1e12326b0ff60320de0480bb1b54e0b62e39104f9800689",
+      "architecture": "arm64",
+      "labels": {
+        "ai.sglang.build.commit": "94602c9c2b7cbdb8efd5c52802dac6a1c180089e",
+        "ai.sglang.build.url": "https://github.com/sgl-project/sglang/actions/runs/35322364074",
+        "ai.sglang.image.tag": "lmsysorg/sglang:v0.5.20",
+        "com.nvidia.cudnn.version": "9.14.0.64-1",
+        "io.kvcached.engine": "sglang",
+        "io.kvcached.engine.version": "0.5.20",
+        "maintainer": "NVIDIA CORPORATION <cudatools@nvidia.com>",
+        "org.opencontainers.image.base.digest": "sha256:06e4f2ed21afde4ff513cda65070124e727ba23ccaeff7712b8c40e1097d611f",
+        "org.opencontainers.image.base.name": "lmsysorg/sglang:v0.5.20",
+        "org.opencontainers.image.revision": "a5deb46194d4958c50e595ca83057a4e0fbc1005",
+        "org.opencontainers.image.source": "https://github.com/fusheng-ji/kvcached",
+        "org.opencontainers.image.url": "https://github.com/sgl-project/sglang/actions/runs/35322364074",
+        "org.opencontainers.image.version": "0.1.6"
+      },
+      "engine": "0.5.20",
+      "kvcached": "0.1.6",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "installation": {
+        "version": "0.1.6",
+        "architecture": "aarch64",
+        "extension": "/opt/sglang/lib/python3.12/site-packages/kvcached/_C.cpython-312-aarch64-linux-gnu.so",
+        "elf_machine": 183,
+        "autopatch_hooks": true
+      },
+      "native_build": "passed"
+    }
+  },
+  "model": {
+    "id": "Qwen/Qwen2.5-0.5B-Instruct",
+    "revision": "7ae557604adf67be50417f59c2c2f167def9a775"
+  },
+  "cpu_tests": {
+    "passed": 1349,
+    "skipped": 12,
+    "warnings": 5,
+    "command": "PYTHON=/tmp/kvcached-test-venv/bin/python bash tools/run_cpu_tests.sh -q"
+  },
+  "static_checks": {
+    "actionlint": "1.7.12 passed",
+    "test_classification": "93 classified; passed",
+    "shell_syntax": "passed",
+    "git_diff_check": "passed"
+  },
+  "gpu": {
+    "inference_source_revision": "dd93b4c9819215c7890b3bb384920c380e84272f",
+    "inference": {
+      "vllm": "passed",
+      "sglang": "passed"
+    },
+    "inference_checks": [
+      "health",
+      "real generation",
+      "greedy token comparison with native engine",
+      "prefix-cache comparison",
+      "required patches",
+      "shutdown and owned IPC cleanup"
+    ],
+    "inference_evidence": "/home/yiyispark/Desktop/kvcached-validation/arm64/dd93b4c-full/run.log",
+    "evidence_limit": "The driver was interrupted during elastic startup before its final JSON writer. Inference PASS checkpoints and complete server logs are retained; this is not complete release qualification.",
+    "elastic_reclaim": "interrupted_before_measurement",
+    "reason": "A new unrelated FastVideo GPU workload (PID 3010769) started during elastic startup. Only this qualification was stopped, preserving the workload as requested.",
+    "final_source_gpu_validation": "pending_idle_gpu",
+    "deferred_status": "/home/yiyispark/Desktop/kvcached-validation/arm64/a5deb46-gpu-status.json",
+    "deferred_source_snapshot": "/home/yiyispark/Desktop/kvcached-validation/source-a5deb46",
+    "deferred_behavior": "Wait for three idle samples one minute apart; run both immutable images without reinstalling. Stop test workloads if training resumes, retain failed attempt evidence, wait again. Stop on actual validation failure.",
+    "memory_method": "Persistent CUDA primary context on selected device; cuMemGetInfo fallback for nvidia-smi N/A.",
+    "shared_kv_budget_mib": 2048
+  },
+  "fixes_validated": [
+    "Pinned model prefetch through host HTTP proxies; offline serving.",
+    "SGLang scheduler shutdown releases registered pool IPC; true-device inference and cleanup passed.",
+    "CPU tests cover shrink-before-expand budget transfers, reserved pages, sampling errors, GPU ownership and interrupted evidence.",
+    "Promotion rejects missing architecture, revision mismatch and incomplete evidence; stages both manifests before official tags."
+  ],
+  "artifact_directory": "/home/yiyispark/Desktop/kvcached-validation/arm64",
+  "amd64": {
+    "build": "not_run",
+    "gpu_validation": "pending_user_machine",
+    "instructions": "docker/README.md: native build with linux/amd64, then identical release-profile command"
+  },
+  "publication": {
+    "pull_request_created": false,
+    "images_pushed": false,
+    "release_workflows_executed": false
+  }
+}
