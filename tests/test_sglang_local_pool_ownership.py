@@ -85,3 +85,52 @@ def test_sglang_keeps_real_tp_size_for_ipc_but_owns_pool_locally(
         "own_segment": True,
         "page_size": interfaces.PAGE_SIZE,
     }
+
+
+@pytest.mark.parametrize("pool_result", [True, False, "error"])
+def test_shutdown_stops_pools_before_native_allocator(monkeypatch, pool_result):
+    calls = []
+
+    def stop_pool():
+        calls.append("pool")
+        if pool_result == "error":
+            raise RuntimeError("busy")
+        return pool_result
+
+    manager = types.SimpleNamespace(shutdown=stop_pool)
+    monkeypatch.setattr(interfaces, "_kvcached_initialized", True)
+    monkeypatch.setattr(interfaces, "stop_worker_listener_threads", lambda: True)
+    monkeypatch.setattr(interfaces, "get_registered_kv_cache_pools", lambda **_: [(manager, "sglang")])
+    monkeypatch.setattr(interfaces, "_shutdown_kvcached_impl", lambda: calls.append("allocator"))
+    monkeypatch.setattr(interfaces, "clear_registered_kv_cache_pools", lambda **_: calls.append("registry"))
+    assert interfaces.shutdown_kvcached() is (pool_result is True)
+    assert calls == (["pool", "allocator", "registry"] if pool_result is True else ["pool"])
+    assert interfaces._kvcached_initialized is (pool_result is not True)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("interrupt", [True, False])
+def test_scheduler_event_loop_releases_owned_resources(monkeypatch, enabled, interrupt):
+    from kvcached.integration.sglang.patches import SchedulerShutdownPatch
+
+    calls = []
+
+    class Scheduler:
+        def run_event_loop(self):
+            calls.append("loop")
+            if interrupt:
+                raise KeyboardInterrupt()
+            return 42
+
+    monkeypatch.setenv("ENABLE_KVCACHED", str(enabled).lower())
+    monkeypatch.setattr(interfaces, "shutdown_kvcached", lambda: calls.append("shutdown") or True)
+    module = types.SimpleNamespace(Scheduler=Scheduler)
+    patch = SchedulerShutdownPatch()
+    assert patch.patch_event_loop(module)
+    assert patch.patch_event_loop(module)
+    if interrupt:
+        with pytest.raises(KeyboardInterrupt):
+            Scheduler().run_event_loop()
+    else:
+        assert Scheduler().run_event_loop() == 42
+    assert calls == (["loop", "shutdown"] if enabled else ["loop"])

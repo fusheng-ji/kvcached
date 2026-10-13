@@ -87,3 +87,33 @@ def test_compare_with_native():
     assert failed == {"gen_seq_tokens_equal", "apc_0_tokens_equal",
                       "apc_1_tokens_equal", "apc_2_tokens_equal", "apc_0_cached_tokens_equal",
                       "apc_1_cached_tokens_equal", "apc_2_cached_tokens_equal"}
+
+
+def test_proxy_forwarding_uses_names_without_redundant_socks(monkeypatch):
+    from e2e.run import NETWORK_ENV, proxy_flags
+    for name in NETWORK_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://private.example:80")
+    monkeypatch.setenv("HTTPS_PROXY", "http://private.example:80")
+    monkeypatch.setenv("ALL_PROXY", "socks5://private.example:1080")
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+    flags = proxy_flags()
+    assert flags == ["-e", "HTTP_PROXY", "-e", "HTTPS_PROXY", "-e", "NO_PROXY"]
+    assert not any("private.example" in value for value in flags)
+
+
+def test_release_model_revision_is_explicit():
+    from e2e.matrix import MODELS
+    model = MODELS["release05b"]
+    assert len(model.revision) == 40
+    for engine in ("vllm", "sglang"):
+        args = Case(engine, "release05b", "c1").args()
+        assert args[args.index("--revision") + 1] == model.revision
+
+
+def test_native_comparison_rejects_missing_results():
+    # A pair of empty result lists must never count as equal passing outputs.
+    kv = _case("kv", [1], 1)
+    native = _case("native", [1], 1)
+    native.phases["gen_seq"].results.clear()
+    assert not next(c.ok for c in compare_with_native(kv, native) if c.name == "gen_seq_tokens_equal")

@@ -40,7 +40,7 @@ ENGINES = {
         name="sglang",
         image="lmsysorg/sglang:v0.5.20",
         patched_re=r"Successfully patched sglang: (.*)",
-        required_patches=("elastic_allocator", "elastic_memory_pool"),
+        required_patches=("elastic_allocator", "elastic_memory_pool", "scheduler_shutdown"),
         capacity_re=r"max_total_num_tokens=(\d+)",
         tokens_re=r"max_total_num_tokens=(\d+)",
     ),
@@ -55,6 +55,7 @@ class ModelSpec:
     args: dict[str, tuple[str, ...]]
     # Extra patches required on top of the engine's list, per engine.
     extra_patches: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    revision: Optional[str] = None
 
 
 MODELS = {
@@ -133,6 +134,7 @@ MODELS = {
 # Small release qualification model with a bounded server footprint on GB10.
 MODELS["release05b"] = ModelSpec(
     "release05b", "Qwen/Qwen2.5-0.5B-Instruct",
+    revision="7ae557604adf67be50417f59c2c2f167def9a775",
     args={
         "vllm": ("--dtype", "bfloat16", "--max-model-len", "8192",
                  "--max-num-seqs", "32", "--gpu-memory-utilization", "0.25"),
@@ -173,7 +175,10 @@ class Case:
 
     def args(self) -> tuple[str, ...]:
         """Server arguments for the model, the parallelism and the KV dtype."""
-        args = MODELS[self.model].args[self.engine]
+        model = MODELS[self.model]
+        args = model.args[self.engine]
+        if model.revision:
+            args += ("--revision", model.revision)
         if self.tp > 1:
             args += (TP_FLAG[self.engine], str(self.tp))
         if self.fp8_kv:

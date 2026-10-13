@@ -2166,6 +2166,48 @@ class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):
             return False
 
 
+class SchedulerShutdownPatch(VersionAwarePatch, BasePatch):
+    """Release worker-owned IPC before multiprocessing bypasses destructors."""
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.scheduler"
+    target_class = "Scheduler"
+    patch_name = "scheduler_shutdown"
+
+    def apply(self, sched_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_event_loop(sched_mod)
+
+    @version_range(">=0.5.20,<0.5.21.dev0")
+    def patch_event_loop(self, sched_mod: types.ModuleType) -> bool:
+        scheduler = self._get_target_class(sched_mod)
+        original = getattr(scheduler, "run_event_loop", None)
+        if original is None:
+            return False
+        if self._is_already_patched(original, "shutdown"):
+            return True
+        logger = self.logger
+
+        @functools.wraps(original)
+        def run_event_loop(self, *args, **kwargs):
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                if enable_kvcached():
+                    try:
+                        from kvcached.integration.sglang.interfaces import shutdown_kvcached
+
+                        if not shutdown_kvcached():
+                            logger.warning("SGLang KV shutdown did not complete")
+                    except Exception as e:
+                        logger.warning("Failed to shut down SGLang KV resources: %s", e)
+
+        self._mark_as_patched(run_event_loop, "shutdown")
+        scheduler.run_event_loop = run_event_loop
+        return True
+
+
 class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
     """Patch SGLang scheduler to suppress memory leak check when kvcached is enabled"""
 

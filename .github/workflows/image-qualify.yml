@@ -9,6 +9,10 @@ on:
         type: choice
         options: [arm64, amd64]
         required: true
+      gpu:
+        description: Idle GPU index or UUID on the selected native runner
+        default: '0'
+        required: true
 permissions:
   contents: read
   actions: read
@@ -31,6 +35,7 @@ jobs:
           gh api "repos/$GH_REPO/actions/runs/$RUN" > run.json
           python3 - <<'PY'
           import json, os
+          assert os.environ['RUN'].isdecimal()
           r = json.load(open('run.json'))
           assert r['head_sha'] == os.environ['GITHUB_SHA'] and r['conclusion'] == 'success'
           assert r['path'] == '.github/workflows/images.yml' and r['event'] == 'workflow_dispatch'
@@ -51,9 +56,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
           ARCH: ${{ inputs.architecture }}
+          GPU: ${{ inputs.gpu }}
         run: |
           python3 tools/release/images.py qualify --candidates candidates --evidence evidence \
-            --revision "$GITHUB_SHA" --namespace "${OWNER,,}" --arch "$ARCH"
+            --revision "$GITHUB_SHA" --namespace "${OWNER,,}" --arch "$ARCH" --gpus "$GPU"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -16,6 +16,7 @@ from kvcached.observability import (
 )
 from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
+    get_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
 from kvcached.tp_ipc_util import (
@@ -93,6 +94,17 @@ def shutdown_kvcached() -> bool:
 
     if not stop_worker_listener_threads():
         logger.warning("KV shutdown deferred: a worker IPC listener is still active")
+        return False
+    pools_stopped = True
+    for manager, _ in get_registered_kv_cache_pools(integration="sglang"):
+        try:
+            if manager.shutdown() is False:
+                pools_stopped = False
+        except Exception as e:
+            pools_stopped = False
+            logger.warning("Failed to shut down KV cache pool %s: %s",
+                           getattr(manager, "pool_name", None), e)
+    if not pools_stopped:
         return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="sglang")

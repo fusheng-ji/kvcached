@@ -1,7 +1,7 @@
 name: Container candidates
 on:
   pull_request:
-    paths: ['docker/**', 'kvcached/**', 'csrc/**', 'setup.py', 'pyproject.toml', '.dockerignore', '.github/workflows/image*.yml', 'tools/release/**', 'tests/e2e/**']
+    paths: ['docker/**', 'kvcached/**', 'csrc/**', 'setup.py', 'pyproject.toml', '.dockerignore', '.github/workflows/image*.yml', 'tools/release/**', 'tests/e2e/**', 'tests/test_release_images.py']
   workflow_dispatch:
 permissions:
   contents: read

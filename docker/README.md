@@ -117,7 +117,11 @@ done
 
 Use an idle NVIDIA GPU, a compatible NVIDIA container runtime and Python 3.10+
 on the host. The public Qwen2.5-0.5B-Instruct model downloads into the Hugging Face
-cache on the first run. Do not run qualification alongside a training job.
+cache on the first run, pinned to revision
+`7ae557604adf67be50417f59c2c2f167def9a775`. Both engines then run offline.
+Host HTTP(S) proxy settings are forwarded by environment-variable name; proxy
+credentials are not written to command logs. Do not run qualification alongside
+a training job. Use a fresh output directory for each qualification attempt.
 
 ```bash
 python3 tests/e2e/run.py --profile release --gpus 0 --no-install \
@@ -138,7 +142,13 @@ primary context on the GPU selected by PCI identity and reads `cuMemGetInfo`.
 Errors in initialization or the sampling thread fail qualification. These CUDA
 counters on unified-memory systems are **not** Linux `MemAvailable`.
 
-The bounded elastic test sets each instance's KV limit to 2 GiB, tests allocation,
+The bounded elastic test shares one 2 GiB KV budget between both instances.
+It calibrates with equal allowances, gives A 85% and B 15%, then transfers the
+allowances after A drains, and restores equal shares for concurrent requests.
+Every transfer waits for used **plus reserved** pages to fit the smaller allowance
+before expanding the other instance. Samples retain all three shared-memory
+counters (limit, used, reserved). The test uses 1–2 reserved page bundles per
+instance, avoiding large idle reserves on this small model. It tests allocation,
 release of at least half the observed growth after cache reset (including a
 driver-visible memory decrease, with 64 MiB accounting tolerance), subsequent growth
 by the second instance, concurrent requests and unchanged greedy probes. It uses
@@ -169,15 +179,19 @@ lowercased for GHCR, so forks publish to their own namespace automatically.
    `IMAGE_ARM64_GPU_RUNNER` / `IMAGE_AMD64_GPU_RUNNER` with JSON label arrays.
    They need Docker, the NVIDIA runtime, Python, `gh`, model-network access and
    disk space for both images. Dispatch **Qualify container candidates** once
-   per architecture using the successful candidate run ID. Each tests exact
+   per architecture using the successful candidate run ID and the `gpus` input
+   (default `0`) to select an idle device. Each tests exact
    digests, without reinstalling kvcached, and uploads GPU evidence and logs.
 4. Inspect both results. Configure the `container-release` GitHub environment
    with required reviewers for human approval. Dispatch **Promote qualified
    containers** with the candidate run ID and both qualification run IDs.
    It verifies successful workflow provenance, matching commits, four image
    platforms/version labels and complete passing evidence bound to each digest.
-   Only then does it create the two multi-platform version manifests and update
-   `latest`. Metadata validation does not pull image layers.
+   Evidence includes installation and model-cache checks, setup provenance,
+   deterministic inference and shared-budget reclamation results. It stages and
+   verifies both two-platform indexes under commit candidate tags before touching
+   official tags. Version tags and `latest` then use those immutable index digests.
+   Metadata validation does not pull image layers.
 
 Tags retain the existing format, for example
 `kvcached-v0.1.6-vllm-v0.30.0`. Update Dockerfile version labels, the qualification

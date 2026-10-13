@@ -43,6 +43,21 @@ ERROR_SIGNATURES = (r"Traceback \(most recent call last\)", r"CUDA error",
                     r"Error applying")
 
 
+# Pass names, not values, so credentials in proxy URLs never enter command logs.
+NETWORK_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+               "http_proxy", "https_proxy", "all_proxy", "no_proxy")
+
+
+def proxy_flags() -> list[str]:
+    names = [name for name in NETWORK_ENV if name in os.environ]
+    # httpx initializes ALL_PROXY even when protocol-specific proxies cover all
+    # model URLs; an unrelated SOCKS fallback would require optional socksio.
+    if any(n in names for n in ("HTTP_PROXY", "http_proxy")) and any(
+            n in names for n in ("HTTPS_PROXY", "https_proxy")):
+        names = [n for n in names if n.lower() != "all_proxy"]
+    return [part for name in names for part in ("-e", name)]
+
+
 @dataclass
 class Check:
     name: str
@@ -127,6 +142,7 @@ class Container:
         sh(DOCKER + ["run", "-d", "--init", "--name", name, "--gpus", device,
                      "--ipc=host", "--network=host", "-v", f"{hf_cache}:/root/.cache/huggingface",
                      "-v", f"{out_dir}:{OUT_IN_CONTAINER}", "-e", "HF_TOKEN",
+                     *proxy_flags(), "-e", "HF_HOME=/root/.cache/huggingface",
                      "--entrypoint", "sleep", engine.image, "infinity"], check=True)
 
     def exec(self, script: str, timeout: Optional[float] = None,
@@ -163,6 +179,27 @@ python3 -c 'import kvcached, kvcached.vmm_ops; print("kvcached", kvcached.__file
         log.write_bytes(proc.stdout + proc.stderr)
         if proc.returncode != 0:
             raise RuntimeError(f"installing kvcached in {self.name} failed; see {log}")
+
+    def prepare_release_models(self, models: list[str], log: Path) -> None:
+        """Fetch immutable model snapshots once, before starting any GPU servers."""
+        revisions = {MODELS[key].hf_id: MODELS[key].revision for key in models}
+        if not revisions or not all(revisions.values()):
+            raise ValueError("release models require pinned revisions")
+        code = """import json, pathlib
+from huggingface_hub import snapshot_download
+for model, revision in json.loads(MODELS_JSON).items():
+    root = pathlib.Path(snapshot_download(model, revision=revision,
+        allow_patterns=['*.json', '*.safetensors', '*.txt', 'tokenizer*'], max_workers=2))
+    assert (root / 'config.json').is_file(), root
+    assert any(root.glob('*.safetensors')), root
+    assert (root / 'tokenizer_config.json').is_file(), root
+    print(json.dumps({'model': model, 'revision': revision, 'snapshot': str(root)}), flush=True)
+""".replace("MODELS_JSON", repr(json.dumps(revisions)))
+        proc = self.exec(f"HF_HUB_OFFLINE=0 HF_HUB_DOWNLOAD_TIMEOUT=120 python3 -c {shlex.quote(code)}",
+                         timeout=1800)
+        log.write_bytes(proc.stdout + proc.stderr)
+        if proc.returncode:
+            raise RuntimeError(f"model prefetch failed before GPU qualification; see {log}")
 
     def verify_installation(self, log: Path) -> None:
         code = """import importlib.metadata as md, json, pathlib, platform
@@ -355,19 +392,23 @@ def server_env(case: Case, ipc: str) -> dict[str, str]:
 def case_setup(case: Case) -> dict[str, Any]:
     model = MODELS[case.model]
     return {"engine": case.engine, "model": case.model, "hf_id": model.hf_id,
-            "layout": case.layout, "tp": case.tp,
+            "layout": case.layout, "tp": case.tp, "revision": model.revision,
             "kv_cache_dtype": FP8_KV[case.engine][1] if case.fp8_kv else None,
             "model_args": list(model.args[case.engine])}
 
 
 def launch(ct: Container, case: Case, run_id: str, port: int,
-           extra_args: tuple[str, ...] = ()) -> Server:
+           extra_args: tuple[str, ...] = (),
+           extra_env: Optional[dict[str, str]] = None) -> Server:
     model = MODELS[case.model]
     case_dir = ct.out_dir / case.name
     case_dir.mkdir(parents=True, exist_ok=True)
 
     ipc = ipc_name(case.name, run_id)
     env = server_env(case, ipc)
+    if model.revision:
+        env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+    env.update(extra_env or {})
     argv = server_argv(case.engine, model.hf_id, case.args() + extra_args, port)
     cmd = " ".join(f"{k}={v}" for k, v in env.items()) + " " + shlex.join(argv)
     (case_dir / "cmd.txt").write_text(cmd + "\n")
@@ -479,8 +520,11 @@ def compare_with_native(kv: CaseResult, native: CaseResult) -> list[Check]:
     checks = []
     for phase in ("gen_seq", "apc_0", "apc_1", "apc_2"):
         a, b = kv.phases.get(phase), native.phases.get(phase)
-        if a is None or b is None:
+        if a is None or b is None or not a.results or not b.results:
             checks.append(Check(f"{phase}_tokens_equal", False, "phase missing"))
+            continue
+        if len(a.results) != len(b.results) or not a.all_ok or not b.all_ok:
+            checks.append(Check(f"{phase}_tokens_equal", False, "failed or mismatched request counts"))
             continue
         divs = [(i, cl.first_divergence(x.token_ids, y.token_ids))
                 for i, (x, y) in enumerate(zip(a.results, b.results))]
@@ -550,15 +594,17 @@ def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, por
     from e2e import elastic
 
     setups = [{"name": r.name, **r.log["setup"]} for r in results if "setup" in r.log]
-    hf_ids = {s["hf_id"] for s in setups if "hf_id" in s}
-    hf_ids |= {s[k]["hf_id"] for s in setups for k in ("a", "b") if k in s}
+    model_setups = [s for s in setups if "hf_id" in s]
+    model_setups += [s[k] for s in setups for k in ("a", "b") if k in s]
+    hf_ids = {s["hf_id"] for s in model_setups}
     for engine, info in engines.items():
         info.update(env=dict(ENGINES[engine].env),
                     server=shlex.join(server_argv(engine, "MODEL", (), port)))
     setup = {
         "profile": profile, "kvcached_sha": sha, "gpus": gpu_info(gpus), "engines": engines,
         "stop_signal": os.environ.get("E2E_STOP_SIGNAL", "INT"),
-        "model_revisions": {h: model_revision(hf_cache, h) for h in sorted(hf_ids)},
+        "model_revisions": {h: next((s["revision"] for s in model_setups if s["hf_id"] == h and s.get("revision")),
+                                     model_revision(hf_cache, h)) for h in sorted(hf_ids)},
         "workload": WORKLOAD, "checks": CHECKS,
         "cases": [s for s in setups if s.get("kind") != "elastic"],
         "elastic": [s for s in setups if s.get("kind") == "elastic"],
@@ -601,7 +647,7 @@ def main() -> int:
     ap.add_argument("--image", action="append", default=[], metavar="ENGINE=REFERENCE",
                     help="test a finished image; requires --no-install")
     ap.add_argument("--elastic-budget-mib", type=int, default=0,
-                    help="bounded shared KV budget; explicit limit transfer, no GPU ballast")
+                    help="shared total KV budget with verified limit transfer; no GPU ballast")
     ap.add_argument("--port", type=int, default=18000)
     ap.add_argument("--ready-timeout", type=float, default=1800)
     ap.add_argument("--elastic-gpu-mib", type=int, default=0,
@@ -640,6 +686,11 @@ def main() -> int:
                     ct.install_kvcached(a.repo, out / f"{engine}-install.log")
                 ct.verify_installation(out / f"{engine}-installation.json")
                 setup.add("installed_package_verified", True)
+                if a.profile == "release":
+                    models = list(dict.fromkeys(g.model for g in profile.groups
+                                                 if not a.models or g.model in a.models))
+                    ct.prepare_release_models(models, out / f"{engine}-models.log")
+                    setup.add("model_snapshots_ready", True)
                 containers[engine] = ct
                 engine_info[engine] = {"image": spec.image, "digest": ct.image_digest(),
                                        **ct.versions(), **ct.image_metadata()}

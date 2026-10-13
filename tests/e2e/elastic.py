@@ -21,6 +21,7 @@ import fcntl
 import json
 import math
 import os
+import shlex
 import struct
 import threading
 import time
@@ -48,6 +49,9 @@ MAX_TOKENS = 1024
 TARGET = 0.7
 MIB = 1 << 20
 SEGMENT = struct.Struct("=3q")
+# A snapshot of two individually locked segments must not straddle our transfer
+# commands, or it could combine the donor's old limit with the recipient's new one.
+_SEGMENT_SNAPSHOT_LOCK = threading.RLock()
 
 # For setup.json (the CI results issue shows it); keep in step with run_elastic.
 WORKLOAD = (
@@ -60,6 +64,9 @@ WORKLOAD = (
     f"calibration, at most {ELASTIC_BATCH} requests",
     "phases: (1) A gets its load; (2) A's prefix cache is reset; (3) B gets its load and "
     "its prefix cache is reset; (4) both get their loads at the same time",
+    "with a bounded KV budget: calibrate with half each, transfer 85% to A, then "
+    "85% to B after A shrinks, and restore half each for the simultaneous load; "
+    "reserve 1–2 page bundles per server and verify used plus reserved bytes",
     "3 greedy probe prompts of 32 tokens on each server before and after",
 )
 CHECKS = {
@@ -69,6 +76,9 @@ CHECKS = {
     "a_released_memory": "after its prefix cache is reset, A keeps less than half of "
                          "what it grew",
     "b_reused_a_memory": "B's KV usage grows past what was free at A's peak",
+    "b_reused_budget": "B grows beyond its allowance before A's budget was transferred",
+    "shared_budget_enforced": "both requested limits and mapped KV bytes stay within "
+                              "one shared budget, with shrink completed before expansion",
     "contended_requests_ok": "every request succeeds while both loads run",
     "<server>_probe_unchanged": "the probes give the same tokens before and after",
     "<server>_alive": "the server is still running at the end",
@@ -76,25 +86,105 @@ CHECKS = {
 }
 
 
-def read_segments() -> dict[str, int]:
-    """Used KV bytes of every kvcached segment in /dev/shm, read as kvctl does:
+def read_segments(directory: str = "/dev/shm") -> dict[str, dict[str, int]]:
+    """All KV counters of every kvcached segment, read as kvctl does:
     three int64s (limit, used, preallocated) under a shared flock. /dev/shm
     is shared with the containers (--ipc=host), and this is much faster than
     running kvctl once a second."""
-    used = {}
-    for name in os.listdir("/dev/shm"):
-        path = os.path.join("/dev/shm", name)
+    with _SEGMENT_SNAPSHOT_LOCK:
+        return _read_segments(directory)
+
+
+def _read_segments(directory: str) -> dict[str, dict[str, int]]:
+    segments = {}
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
         try:
             if os.path.getsize(path) != SEGMENT.size:
                 continue
             with open(path, "rb") as f:
                 fcntl.flock(f, fcntl.LOCK_SH)
-                limit, in_use, _ = SEGMENT.unpack(f.read(SEGMENT.size))
+                limit, in_use, reserved = SEGMENT.unpack(f.read(SEGMENT.size))
         except (OSError, struct.error):
             continue
-        if limit > 0:
-            used[name] = in_use
-    return used
+        # A requested zero limit must not hide pages still awaiting release.
+        if min(limit, in_use, reserved) >= 0:
+            segments[name] = {"limit": limit, "used": in_use, "preallocated": reserved}
+    return segments
+
+
+def server_segments(srv: Server, segments: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+    return {name: state for name, state in segments.items()
+            if name == srv.ipc or (name.startswith(srv.ipc + "_g")
+                                  and name[len(srv.ipc) + 2:].isdigit())}
+
+
+class SharedBudget:
+    """Transfer one physical KV budget, waiting for shrink before any expansion.
+
+    The bounded release model has one KV pool per instance. Refuse other pool
+    layouts rather than silently limiting only one group of a hybrid model.
+    """
+
+    def __init__(self, servers: list[tuple[Container, Server]], total: int,
+                 timeout: float = 60):
+        self.servers = servers
+        self.total = total
+        self.timeout = timeout
+        self.history: list[dict] = []
+        self.established = False
+
+    @staticmethod
+    def state(srv: Server, segments: Optional[dict] = None) -> dict[str, int]:
+        states = server_segments(srv, read_segments() if segments is None else segments)
+        if set(states) != {srv.ipc}:
+            raise RuntimeError(f"bounded KV test requires one live segment for {srv.ipc}")
+        return states[srv.ipc]
+
+    def _set(self, host: Container, srv: Server, target: int, previous: int) -> None:
+        with _SEGMENT_SNAPSHOT_LOCK:
+            proc = host.exec(f"kvctl limit {shlex.quote(srv.ipc)} {target}")
+        if proc.returncode or b"Error:" in proc.stderr:
+            raise RuntimeError(f"setting KV budget failed: {proc.stderr!r}")
+        # Some integrations observe a new limit at their next scheduler step.
+        # A tiny request drives that step; reset it before measuring the drain.
+        if target < previous and target:
+            if not srv.client.generate(cl.BASE_PROMPTS[0], 1).ok:
+                raise RuntimeError(f"budget shrink probe failed for {srv.ipc}")
+            if not srv.client.reset_prefix_cache():
+                raise RuntimeError(f"budget shrink cache reset failed for {srv.ipc}")
+        deadline = time.monotonic() + self.timeout
+        while True:
+            state = self.state(srv)
+            if state["limit"] == target and state["used"] + state["preallocated"] <= target:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"KV budget did not settle for {srv.ipc}: {state}, target={target}")
+            time.sleep(0.25)
+
+    def within_budget(self, segments: dict) -> bool:
+        states = [self.state(srv, segments) for _, srv in self.servers]
+        return (sum(s["limit"] for s in states) <= self.total
+                and sum(s["used"] + s["preallocated"] for s in states) <= self.total)
+
+    def set_shares(self, shares: tuple[int, int], stage: str) -> None:
+        if len(shares) != len(self.servers) or min(shares) < 0 or sum(shares) > self.total:
+            raise ValueError("instance allowances must fit the shared KV budget")
+        old = [self.state(srv)["limit"] for _, srv in self.servers]
+        # Never grant the recipient capacity until the donor has actually unmapped
+        # enough pages, including its otherwise invisible preallocation reserve.
+        for shrinking in (True, False):
+            for (host, srv), previous, target in zip(self.servers, old, shares):
+                if target != previous and (target < previous) == shrinking:
+                    self._set(host, srv, target, previous)
+                    if self.established and not self.within_budget(read_segments()):
+                        raise RuntimeError("shared KV budget exceeded during transfer")
+        segments = read_segments()
+        if not self.within_budget(segments):
+            raise RuntimeError("shared KV budget was not established")
+        self.established = True
+        self.history.append({"stage": stage, "t": time.time(), "segments": {
+            srv.ipc: dict(self.state(srv, segments)) for _, srv in self.servers}})
 
 
 class Usage:
@@ -103,16 +193,15 @@ class Usage:
     def __init__(self, probe: MemoryProbe) -> None:
         self.probe = probe
         self.error = None
-        self.samples: list[tuple[float, int, dict[str, int]]] = []
+        self.samples: list[tuple[float, int, dict[str, dict[str, int]]]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     @staticmethod
-    def of(srv: Server, segments: dict[str, int]) -> int:
+    def of(srv: Server, segments: dict[str, dict[str, int]], field: str = "used") -> int:
         # A server can have one segment per KV cache group: <ipc>, <ipc>_g1, ...
-        return sum(v for k, v in segments.items()
-                   if k == srv.ipc or k.startswith(srv.ipc + "_g"))
+        return sum(v[field] for v in server_segments(srv, segments).values())
 
     def used(self, srv: Server) -> int:
         return self.of(srv, read_segments())
@@ -198,6 +287,8 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
     res.log["setup"] = setup
     started: list[tuple[Container, Server]] = []
     usage: Optional[Usage] = None
+    budget: Optional[SharedBudget] = None
+    budget_start = 0.0
     try:
         if emulate_gpu_mib:
             _, total = probe.read()
@@ -208,7 +299,10 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
         for host, case, port, extra in ((ct_a, case_a, base_port + 1, pair.extra_args_a),
                                         (ct_b, case_b, base_port + 2, pair.extra_args_b)):
             batch = (BATCH_FLAG[case.engine], str(ELASTIC_BATCH))
-            srv = launch(host, case, run_id, port, extra_args=(*batch, *extra))
+            extra_env = ({"KVCACHED_MIN_RESERVED_PAGES": "1",
+                          "KVCACHED_MAX_RESERVED_PAGES": "2"} if budget_mib else None)
+            srv = launch(host, case, run_id, port, extra_args=(*batch, *extra),
+                         extra_env=extra_env)
             setup["a" if case is case_a else "b"] = srv.setup
             started.append((host, srv))
             ready = srv.client.wait_ready(timeout, lambda: host.alive(srv.pid))
@@ -219,12 +313,12 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
         probes = cl.BASE_PROMPTS[:3]
         base = {s.ipc: s.client.run_phase("probe", probes, 32, 1) for _, s in started}
         if budget_mib:
-            # Limits bound each instance without allocating ballast on unified memory.
-            for host, srv in started:
-                proc = host.exec(f"kvctl limit {srv.ipc} {budget_mib}M")
-                if proc.returncode or b'Error:' in proc.stderr:
-                    raise RuntimeError(f"setting KV budget failed: {proc.stderr!r}")
-            res.log["reuse_scope"] = "bounded KV budget, not device exhaustion"
+            budget = SharedBudget(started, budget_mib * MIB)
+            half = budget.total // 2
+            budget.set_shares((half, budget.total - half), "calibration")
+            budget_start = time.time()
+            res.log["budget_transfers"] = budget.history
+            res.log["reuse_scope"] = "one shared KV budget with shrink-before-expand transfer"
         usage = Usage(probe)
         mem: dict[str, float] = {}
         res.log["memory_mib"] = mem
@@ -245,7 +339,7 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
             idle_gpu, total = probe.read()
             free = (total - idle_gpu) * MIB
             if budget_mib:
-                if free < 2 * budget_mib * MIB:
+                if free < budget_mib * MIB:
                     raise RuntimeError("insufficient free memory for the bounded KV test")
                 free = budget_mib * MIB
             # More than the batch limit would only queue.
@@ -255,6 +349,11 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
                        per_request_b=per_request[b.ipc] / MIB, n_a=n[a.ipc], n_b=n[b.ipc])
 
             # 1. A takes most of the free memory.
+            if budget is not None:
+                small = budget.total * 15 // 100
+                large = budget.total - small
+                budget.set_shares((large, small), "a-heavy")
+                previous_b_allowance = small
             a_idle = usage.used(a)
             t = time.time()
             results = burst(a, pool, n[a.ipc], 10_000)
@@ -270,6 +369,9 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
 
             # 2. A gives its KV memory back.
             a_after = drain(usage, a)
+            if budget is not None:
+                budget.set_shares((small, large), "b-heavy")
+                a_after = usage.used(a)
             mem["gpu_free_after_a"] = total - probe.read()[0]
             if budget_mib:
                 released = mem["gpu_free_after_a"] * MIB - physical_free_at_a_peak
@@ -289,12 +391,16 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
             b_growth = usage.peak(b, t) - b_idle
             res.add("b_requests_ok", all(r.ok for r in results),
                     f"{sum(not r.ok for r in results)}/{len(results)} failed")
-            res.add("b_reused_budget" if budget_mib else "b_reused_a_memory", b_growth > free_at_a_peak,
+            reuse_threshold = max(free_at_a_peak, previous_b_allowance) if budget else free_at_a_peak
+            res.add("b_reused_budget" if budget_mib else "b_reused_a_memory", b_growth > reuse_threshold,
                     f"B grew {b_growth / MIB:.0f} MiB; {free_at_a_peak / MIB:.0f} MiB "
-                    "was free at A's peak")
+                    "was free at A's peak" + (f"; B previously had {previous_b_allowance / MIB:.0f} MiB"
+                                               if budget else ""))
             drain(usage, b)
 
             # 4. Both at once.
+            if budget is not None:
+                budget.set_shares((half, budget.total - half), "simultaneous")
             fa = pool.submit(burst, a, pool, n[a.ipc], 30_000)
             fb = pool.submit(burst, b, pool, n[b.ipc], 40_000)
             results = fa.result() + fb.result()
@@ -317,9 +423,20 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
         if usage is not None:
             usage.stop()
             res.add("memory_sampling", usage.error is None, str(usage.error or ""))
-            # Per-second timeline, MiB: GPU memory used and each server's KV.
+            if budget is not None:
+                try:
+                    observed = [s for t, _, s in usage.samples if t >= budget_start]
+                    within_budget = bool(observed) and all(budget.within_budget(s) for s in observed)
+                    res.add("shared_budget_enforced", within_budget,
+                            f"{len(observed)} samples; shared cap {budget_mib} MiB")
+                except RuntimeError as e:
+                    res.add("shared_budget_enforced", False, str(e))
+            # Timeline in MiB; retain the active-usage series for existing consumers
+            # and include exact counters to audit reservations and budget transfers.
             timeline = [{"t": round(t, 1), "gpu": g,
-                         **{srv.case.name: usage.of(srv, u) >> 20 for _, srv in started}}
+                         **{srv.case.name: usage.of(srv, u) >> 20 for _, srv in started},
+                         "segments": {k: v for _, srv in started
+                                      for k, v in server_segments(srv, u).items()}}
                         for t, g, u in usage.samples]
             (ct_a.out_dir / f"{pair.name}-usage.json").write_text(json.dumps(timeline))
         for host, srv in started:
