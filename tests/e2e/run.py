@@ -22,6 +22,8 @@ import json
 import os
 import re
 import shlex
+import signal
+import threading
 import subprocess
 import sys
 import time
@@ -103,6 +105,50 @@ def gpu_processes(gpus: str = "all") -> list[str]:
     out = sh(["nvidia-smi", *gpu_select(gpus), "--query-compute-apps=pid",
               "--format=csv,noheader"], check=True)
     return [x.strip() for x in out.stdout.decode().splitlines() if x.strip()]
+
+
+class GPUExclusivityGuard:
+    """Interrupt only this driver if another GPU workload starts mid-run."""
+
+    def __init__(self, containers: list[Container], gpus: str):
+        self.containers = containers
+        self.gpus = gpus
+        self.error: Optional[str] = None
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._watch, daemon=True)
+
+    def check(self) -> None:
+        # Take the GPU PID snapshot first: a new owned worker may start while
+        # docker top runs, but cannot become a false foreign PID in this snapshot.
+        active = set(gpu_processes(self.gpus))
+        owned = {str(os.getpid())}  # persistent CUDA memory probe
+        for container in self.containers:
+            proc = sh(DOCKER + ["top", container.name, "-eo", "pid"], timeout=30, check=True)
+            owned.update(line.strip() for line in proc.stdout.decode().splitlines()
+                         if line.strip().isdigit())
+        foreign = active - owned
+        if foreign:
+            raise RuntimeError("GPU became busy with unrelated processes: " + ", ".join(sorted(foreign)))
+
+    def _watch(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self.check()
+            except Exception as e:
+                self.error = str(e)
+                if not self.stop_event.is_set():
+                    os.kill(os.getpid(), signal.SIGINT)
+                return
+            self.stop_event.wait(2)
+
+    def start(self) -> None:
+        self.check()
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread.ident is not None:
+            self.thread.join()
 
 
 # True while a process group has a member that is not a zombie: orphaned
@@ -546,7 +592,7 @@ def report(r: CaseResult) -> None:
 
 
 def write_summary(out: Path, results: list[CaseResult]) -> bool:
-    ok = all(r.ok for r in results)
+    ok = bool(results) and all(r.ok for r in results)
     (out / "summary.json").write_text(json.dumps(
         {"ok": ok, "cases": [r.to_dict() for r in results]}, indent=1))
     lines = ["| case | result | failed checks |", "|---|---|---|"]
@@ -659,6 +705,8 @@ def main() -> int:
         images = image_overrides(a.image, a.no_install, a.local)
     except ValueError as e:
         ap.error(str(e))
+    if a.profile == "release" and a.local:
+        ap.error("release qualification requires container images")
     if a.elastic_budget_mib < 0 or (a.elastic_budget_mib and a.elastic_gpu_mib):
         ap.error("use a nonnegative KV budget, without --elastic-gpu-mib")
     profile = PROFILES[a.profile]
@@ -670,10 +718,13 @@ def main() -> int:
     results: list[CaseResult] = []
 
     engines = [e for e in profile.engines if not a.engines or e in a.engines]
+    if not engines or (a.engines and set(a.engines) - set(profile.engines)):
+        ap.error("select engines from the chosen profile")
     if a.profile == "release" and gpu_processes(a.gpus):
         ap.error("release qualification requires idle GPUs; existing workloads will not be stopped")
     containers: dict[str, Container] = {}
     engine_info: dict[str, dict[str, Any]] = {}
+    guard: Optional[GPUExclusivityGuard] = None
     try:
         for engine in engines:
             spec = replace(ENGINES[engine], image=images.get(engine, ENGINES[engine].image))
@@ -698,6 +749,10 @@ def main() -> int:
                 setup.add("install_kvcached", False, str(e))
                 ct.remove()
             results.append(setup)
+
+        if a.profile == "release" and containers:
+            guard = GPUExclusivityGuard(list(containers.values()), a.gpus)
+            guard.start()
 
         for group in [] if a.skip_cases else profile.groups:
             host = containers.get(group.engine)
@@ -734,7 +789,14 @@ def main() -> int:
                                                a.ready_timeout, a.elastic_gpu_mib,
                                                a.elastic_budget_mib))
                     report(results[-1])
+    except (Exception, KeyboardInterrupt) as e:
+        failure = CaseResult("qualification_interrupted")
+        failure.add("execution_completed", False,
+                    (guard.error if guard and guard.error else str(e)) or type(e).__name__)
+        results.append(failure)
     finally:
+        if guard:
+            guard.stop()
         for ct in containers.values():
             ct.remove()
 

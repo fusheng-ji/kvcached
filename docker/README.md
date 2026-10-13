@@ -113,15 +113,23 @@ for engine in vllm sglang; do
 done
 ```
 
+If your host needs a loopback HTTP proxy, add `--network host --build-arg
+HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY` to the build command.
+Docker reads the configured environment values; do not put credentials in the
+Dockerfile or persist proxy values as image environment variables.
+
 ### Qualify the actual installed images
 
 Use an idle NVIDIA GPU, a compatible NVIDIA container runtime and Python 3.10+
 on the host. The public Qwen2.5-0.5B-Instruct model downloads into the Hugging Face
 cache on the first run, pinned to revision
-`7ae557604adf67be50417f59c2c2f167def9a775`. Both engines then run offline.
+`7ae557604adf67be50417f59c2c2f167def9a775`. Both engines then run offline. SGLang 0.5.20 also receives a scheduler-exit
+hook that releases worker-owned KV segments before multiprocessing exits.
 Host HTTP(S) proxy settings are forwarded by environment-variable name; proxy
 credentials are not written to command logs. Do not run qualification alongside
-a training job. Use a fresh output directory for each qualification attempt.
+a training job. The release harness also watches for unrelated GPU processes
+throughout the run; if another job starts, it stops only its own containers and
+saves a failing interruption result. Use a fresh output directory for each attempt.
 
 ```bash
 python3 tests/e2e/run.py --profile release --gpus 0 --no-install \
@@ -179,7 +187,7 @@ lowercased for GHCR, so forks publish to their own namespace automatically.
    `IMAGE_ARM64_GPU_RUNNER` / `IMAGE_AMD64_GPU_RUNNER` with JSON label arrays.
    They need Docker, the NVIDIA runtime, Python, `gh`, model-network access and
    disk space for both images. Dispatch **Qualify container candidates** once
-   per architecture using the successful candidate run ID and the `gpus` input
+   per architecture using the successful candidate run ID and the `gpu` input
    (default `0`) to select an idle device. Each tests exact
    digests, without reinstalling kvcached, and uploads GPU evidence and logs.
 4. Inspect both results. Configure the `container-release` GitHub environment

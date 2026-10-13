@@ -117,3 +117,63 @@ def test_native_comparison_rejects_missing_results():
     native = _case("native", [1], 1)
     native.phases["gen_seq"].results.clear()
     assert not next(c.ok for c in compare_with_native(kv, native) if c.name == "gen_seq_tokens_equal")
+
+
+def test_gpu_guard_accepts_owned_workers_and_probe(monkeypatch):
+    import os
+    from types import SimpleNamespace
+    from e2e import run
+    monkeypatch.setattr(run, "gpu_processes", lambda _: ["123", str(os.getpid())])
+    monkeypatch.setattr(run, "sh", lambda *a, **k: SimpleNamespace(stdout=b"PID\n123\n456\n"))
+    run.GPUExclusivityGuard([SimpleNamespace(name="ours")], "0").check()
+
+
+def test_gpu_guard_rejects_new_training_without_signalling_it(monkeypatch):
+    import pytest
+    from types import SimpleNamespace
+    from e2e import run
+    monkeypatch.setattr(run, "gpu_processes", lambda _: ["123", "999"])
+    monkeypatch.setattr(run, "sh", lambda *a, **k: SimpleNamespace(stdout=b"PID\n123\n"))
+    with pytest.raises(RuntimeError, match="unrelated processes: 999"):
+        run.GPUExclusivityGuard([SimpleNamespace(name="ours")], "0").check()
+
+
+def test_interruption_keeps_completed_results(tmp_path, monkeypatch):
+    import json
+    import sys
+    from e2e import run
+
+    class FakeContainer:
+        def __init__(self, *args): pass
+        def verify_installation(self, *args): pass
+        def prepare_release_models(self, *args): pass
+        def image_digest(self): return "digest"
+        def versions(self): return {}
+        def image_metadata(self): return {}
+        def remove(self): removed.append(True)
+
+    class Guard:
+        error = "GPU became busy with unrelated processes: 999"
+        def __init__(self, *args): pass
+        def start(self): pass
+        def stop(self): pass
+
+    def interrupt(*args):
+        raise KeyboardInterrupt()
+
+    removed = []
+    monkeypatch.setattr(sys, "argv", ["run.py", "--profile", "release", "--engines", "vllm",
+                                     "--no-install", "--out", str(tmp_path)])
+    monkeypatch.setattr(run, "Container", FakeContainer)
+    monkeypatch.setattr(run, "GPUExclusivityGuard", Guard)
+    monkeypatch.setattr(run, "gpu_processes", lambda _: [])
+    monkeypatch.setattr(run, "gpu_info", lambda _: [])
+    monkeypatch.setattr(run, "kvcached_sha", lambda _: "a" * 40)
+    monkeypatch.setattr(run, "run_server_case", interrupt)
+    assert run.main() == 1
+    assert removed == [True]
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert not summary["ok"]
+    assert summary["cases"][0]["ok"]  # installation evidence survived interruption
+    assert summary["cases"][-1]["checks"][0]["detail"].endswith("999")
+    assert (tmp_path / "setup.json").is_file()
